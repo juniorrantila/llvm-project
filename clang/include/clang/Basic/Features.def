@@ -283,5 +283,9 @@ FEATURE(cxx_abi_relative_vtable, LangOpts.CPlusPlus && LangOpts.RelativeCXXABIVT
 // CUDA/HIP Features
 FEATURE(cuda_noinline_keyword, LangOpts.CUDA)
 
+// Junior's secret sauce extensions
+FEATURE(guard, true)
+EXTENSION(guard, true)
+
 #undef EXTENSION
 #undef FEATURE

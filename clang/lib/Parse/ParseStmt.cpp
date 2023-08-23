@@ -300,6 +300,8 @@ Retry:
 
   case tok::kw_if:                  // C99 6.8.4.1: if-statement
     return ParseIfStatement(TrailingElseLoc);
+  case tok::kw_guard:
+    return ParseGuardStatement(TrailingElseLoc);
   case tok::kw_switch:              // C99 6.8.4.2: switch-statement
     return ParseSwitchStatement(TrailingElseLoc);
 
@@ -1667,6 +1669,127 @@ StmtResult Parser::ParseIfStatement(SourceLocation *TrailingElseLoc) {
                                  : IfStatementKind::ConstevalNonNegated;
 
   return Actions.ActOnIfStmt(IfLoc, Kind, LParen, InitStmt.get(), Cond, RParen,
+                             ThenStmt.get(), ElseLoc, ElseStmt.get());
+}
+
+/// ParseGuardStatement
+///       guard-statement:
+///         'guard' '(' expression ')' 'else' statement
+/// [C++]   'guard' '(' condition ')' 'else' statement
+///
+StmtResult Parser::ParseGuardStatement(SourceLocation *TrailingElseLoc) {
+  assert(Tok.is(tok::kw_guard) && "Not a guard stmt!");
+  SourceLocation GuardLoc = ConsumeToken();  // eat the 'guard'.
+
+  bool IsConstexpr = false;
+  if (Tok.is(tok::kw_constexpr)) {
+    Diag(Tok, getLangOpts().CPlusPlus17 ? diag::warn_cxx14_compat_constexpr_if
+                                        : diag::ext_constexpr_if);
+    IsConstexpr = true;
+    ConsumeToken();
+  }
+  if (Tok.isNot(tok::l_paren)) {
+    Diag(Tok, diag::err_expected_lparen_after) << "guard";
+    SkipUntil(tok::semi);
+    return StmtError();
+  }
+
+  bool C99orCXX = getLangOpts().C99 || getLangOpts().CPlusPlus;
+
+  // Parse the condition.
+  StmtResult InitStmt;
+  Sema::ConditionResult Cond;
+  SourceLocation LParen;
+  SourceLocation RParen;
+  std::optional<bool> ConstexprCondition;
+  if (ParseParenExprOrCondition(&InitStmt, Cond, GuardLoc,
+                                IsConstexpr ? Sema::ConditionKind::ConstexprIf
+                                            : Sema::ConditionKind::Boolean,
+                                LParen, RParen))
+    return StmtError();
+  if (IsConstexpr)
+      ConstexprCondition = Cond.getKnownValue();
+
+  if (Tok.isNot(tok::kw_else)) {
+    Diag(Tok, diag::err_expected_after) << "guard"
+                                        << "else";
+    SkipUntil(tok::semi);
+    return StmtError();
+  }
+
+  SourceLocation ElseLoc;
+  SourceLocation ElseStmtLoc;
+  StmtResult ElseStmt;
+
+  if (TrailingElseLoc)
+    *TrailingElseLoc = Tok.getLocation();
+
+  ElseLoc = ConsumeToken();
+  ElseStmtLoc = Tok.getLocation();
+
+  // C99 6.8.4p3 - In C99, the body of the if statement is a scope, even if
+  // there is no compound stmt.  C90 does not have this clause.  We only do
+  // this if the body isn't a compound statement to avoid push/pop in common
+  // cases.
+  //
+  // C++ 6.4p1:
+  // The substatement in a selection-statement (each substatement, in the else
+  // form of the if statement) implicitly defines a local scope.
+  //
+  ParseScope InnerScope(this, Scope::DeclScope, C99orCXX,
+                        Tok.is(tok::l_brace));
+
+  MisleadingIndentationChecker MIChecker(*this, MSK_else, ElseLoc);
+  bool ShouldEnter = ConstexprCondition && *ConstexprCondition;
+  Sema::ExpressionEvaluationContext Context =
+      Sema::ExpressionEvaluationContext::DiscardedStatement;
+
+  EnterExpressionEvaluationContext PotentiallyDiscarded(
+      Actions, Context, nullptr,
+      Sema::ExpressionEvaluationContextRecord::EK_Other, ShouldEnter);
+  ElseStmt = ParseStatement();
+  if (ElseStmt.isUsable())
+    MIChecker.Check();
+
+  // Pop the 'else' scope if needed.
+  InnerScope.Exit();
+
+  if (ElseStmt.isInvalid() || ElseStmt.get() == nullptr) {
+    return StmtError();
+  }
+
+  Stmt::StmtClass ElseStmtClass = ElseStmt.get()->getStmtClass();
+  if (ElseStmtClass != Stmt::ReturnStmtClass &&
+      ElseStmtClass != Stmt::BreakStmtClass &&
+      ElseStmtClass != Stmt::ContinueStmtClass &&
+      ElseStmtClass != Stmt::CXXThrowExprClass &&
+      ElseStmtClass != Stmt::GotoStmtClass) {
+    auto ElseChildren = ElseStmt.get()->children();
+    if (ElseChildren.empty()) {
+      Diag(ElseLoc, diag::err_expected_return_at_end_of_guard_block);
+      return StmtError();
+    }
+    Stmt* LastStmt;
+    for (auto* Child : ElseChildren) {
+      LastStmt = Child;
+    }
+    Stmt::StmtClass LastStmtClass = LastStmt->getStmtClass();
+    if (LastStmtClass != Stmt::ReturnStmtClass &&
+        LastStmtClass != Stmt::BreakStmtClass &&
+        LastStmtClass != Stmt::ContinueStmtClass &&
+        LastStmtClass != Stmt::CXXThrowExprClass &&
+        LastStmtClass != Stmt::GotoStmtClass) {
+      Diag(LastStmt->getBeginLoc(), diag::err_expected_return_at_end_of_guard_block);
+      return StmtError();
+    }
+  }
+
+  StmtResult ThenStmt = Actions.ActOnNullStmt(GuardLoc);
+  IfStatementKind Kind = IfStatementKind::Ordinary;
+  if (IsConstexpr)
+    Kind = IfStatementKind::Constexpr;
+
+  return Actions.ActOnIfStmt(GuardLoc, Kind, LParen, InitStmt.get(), Cond, RParen,
                              ThenStmt.get(), ElseLoc, ElseStmt.get());
 }
 
